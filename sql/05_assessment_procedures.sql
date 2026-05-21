@@ -1,0 +1,127 @@
+
+USE ROLE MONITORING_ASSESSMENT_ROLE;
+USE SECONDARY ROLES NONE;
+USE WAREHOUSE MONITORING_ASSESSMENT_WH;
+
+
+CREATE OR REPLACE PROCEDURE MONITORING_ASSESSMENT_DB.ASSESSMENT.SP_UPDATE_MONITORING_RULES(
+    RULE_ID INT,
+    ENABLED BOOLEAN
+)
+RETURNS STRING
+LANGUAGE SQL 
+EXECUTE AS CALLER 
+AS 
+$$
+BEGIN 
+    UPDATE MONITORING_ASSESSMENT_DB.ASSESSMENT.MONITORING_RULES
+    SET 
+        ENABLED = :ENABLED
+    WHERE RULE_ID = :RULE_ID;
+
+    RETURN 'SUCCESS';
+END;
+$$;
+
+
+CREATE OR REPLACE PROCEDURE MONITORING_ASSESSMENT_DB.ASSESSMENT.SP_MONITOR_EVENTS()
+RETURNS STRING
+LANGUAGE SQL 
+EXECUTE AS CALLER 
+AS 
+$$
+DECLARE 
+    V_CURSOR CURSOR FOR SELECT RULE_ID, RULE_OBJECT FROM MONITORING_ASSESSMENT_DB.ASSESSMENT.MONITORING_RULES WHERE ENABLED = TRUE;
+    V_RULE_ID INTEGER;
+    V_RULE_OBJECT STRING;
+BEGIN 
+    FOR REC IN V_CURSOR DO
+        
+        V_RULE_ID := REC.RULE_ID;
+        V_RULE_OBJECT := REC.RULE_OBJECT;
+        
+        INSERT INTO MONITORING_ASSESSMENT_DB.ASSESSMENT.MONITORING_EVENTS (
+            RULE_ID,
+            QUERY_ID,
+            EVENT_TIME,
+            USER_NAME,
+            ROLE_NAME,
+            QUERY_TEXT
+        )
+        SELECT 
+            :V_RULE_ID,
+            ro.QUERY_ID,
+            ro.START_TIME AS EVENT_TIME,
+            ro.USER_NAME,
+            ro.ROLE_NAME,
+            ro.QUERY_TEXT
+        FROM 
+            IDENTIFIER(:V_RULE_OBJECT) ro
+        WHERE 1=1 
+            AND NOT EXISTS (
+            SELECT 1 FROM MONITORING_ASSESSMENT_DB.ASSESSMENT.MONITORING_EVENTS e
+            WHERE e.QUERY_ID = ro.QUERY_ID
+            AND e.RULE_ID = :V_RULE_ID
+        );
+    
+    END FOR;
+
+    RETURN 'SUCCESS';
+END;
+$$;
+
+
+CREATE OR REPLACE PROCEDURE MONITORING_ASSESSMENT_DB.ASSESSMENT.SP_CORTEX_SUMMARIZE_EVENTS()
+RETURNS STRING
+LANGUAGE SQL 
+EXECUTE AS CALLER 
+AS 
+$$
+BEGIN 
+
+    CREATE OR REPLACE TEMPORARY TABLE MONITORING_ASSESSMENT_DB.ASSESSMENT.TMP_CORTEX_RESULTS AS
+    SELECT 
+        ev.EVENT_ID,
+        AI_COMPLETE(
+            model => 'claude-4-sonnet',
+            prompt => '
+            Analyse this Snowflake query event and provide a concise summary of what has occured. 
+
+            Rules:
+            - event_summary: maximum of 30 words
+            - no numbered lists
+            - remove sensitive information
+
+            Event details:
+            - Rule Domain: ' || er.RULE_DOMAIN || '
+            - Rule Description: ' || er.RULE_DESCRIPTION || '
+            - Snowflake Query: ' || ev.QUERY_TEXT || '
+            ',
+            model_parameters => {
+                'temperature': 0,
+                'max_tokens': 500
+            },
+            response_format => TYPE OBJECT(
+                event_summary STRING
+            )
+        ) AS GENERATED_RESPONSE  
+    FROM 
+        MONITORING_ASSESSMENT_DB.ASSESSMENT.MONITORING_EVENTS ev 
+    INNER JOIN
+        MONITORING_ASSESSMENT_DB.ASSESSMENT.MONITORING_RULES er ON er.RULE_ID = ev.RULE_ID
+    WHERE 1=1 
+        AND ev.CORTEX_RESPONSE IS NULL;
+
+    MERGE INTO MONITORING_ASSESSMENT_DB.ASSESSMENT.MONITORING_EVENTS tgt
+    USING MONITORING_ASSESSMENT_DB.ASSESSMENT.TMP_CORTEX_RESULTS src
+    ON tgt.EVENT_ID = src.EVENT_ID
+    WHEN MATCHED THEN UPDATE SET 
+        tgt.CORTEX_RESPONSE = src.GENERATED_RESPONSE,
+        tgt.CORTEX_SUMMARY = src.GENERATED_RESPONSE:event_summary::STRING;
+
+    DROP TABLE IF EXISTS MONITORING_ASSESSMENT_DB.ASSESSMENT.TMP_CORTEX_RESULTS;
+
+    RETURN 'SUCCESS';
+
+END;
+$$
